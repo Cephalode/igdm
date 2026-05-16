@@ -1,0 +1,13 @@
+# Binaries
+igdm
+igdm-go
+
+# Data directory (sessions, memory, personality)
+.igdm/
+
+# Config files with private data
+personality.json
+config.json
+
+# Allow go.sum
+!go.sum
