@@ -557,6 +557,71 @@ func (c *IGClient) WaitForReady(ctx context.Context, timeout time.Duration) erro
 	return c.client.WaitUntilCanSendMessages(ctx, timeout)
 }
 
+// ThreadMessage represents a single message in a thread's history.
+type ThreadMessage struct {
+	MessageID string
+	ThreadKey int64
+	SenderID  int64
+	Text      string
+	Timestamp time.Time
+}
+
+// GetThreadHistory fetches recent messages from a thread using FetchMessagesTask.
+// limit controls the max number of messages returned (0 = use library default).
+func (c *IGClient) GetThreadHistory(ctx context.Context, threadKey int64, limit int) ([]ThreadMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.connected {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	task := &socket.FetchMessagesTask{
+		ThreadKey:            threadKey,
+		Direction:            0, // fetch latest
+		ReferenceTimestampMs: time.Now().UnixMilli(),
+		SyncGroup:            1,
+	}
+
+	resp, err := c.client.ExecuteTasks(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("fetch messages: %w", err)
+	}
+
+	var messages []ThreadMessage
+
+	// Collect from both upsert and insert message arrays
+	for _, m := range resp.LSUpsertMessage {
+		if m != nil && m.Text != "" {
+			messages = append(messages, ThreadMessage{
+				MessageID: m.MessageId,
+				ThreadKey: m.ThreadKey,
+				SenderID:  m.SenderId,
+				Text:      m.Text,
+				Timestamp: time.UnixMilli(m.TimestampMs),
+			})
+		}
+	}
+	for _, m := range resp.LSInsertMessage {
+		if m != nil && m.Text != "" {
+			messages = append(messages, ThreadMessage{
+				MessageID: m.MessageId,
+				ThreadKey: m.ThreadKey,
+				SenderID:  m.SenderId,
+				Text:      m.Text,
+				Timestamp: time.UnixMilli(m.TimestampMs),
+			})
+		}
+	}
+
+	// Apply limit
+	if limit > 0 && len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+
+	return messages, nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
