@@ -23,7 +23,15 @@ import (
 	"github.com/ocythoe/igdm-go/internal/login"
 )
 
-const configPath = "~/.igdm/config.json"
+func getConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal().Err(err).Msg("get home dir")
+	}
+	return filepath.Join(home, ".igdm", "config.json")
+}
+
+var configPath = getConfigPath()
 
 func main() {
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
@@ -811,7 +819,7 @@ func runAgent(ctx context.Context, cfg *config.Config, accountName string) {
 			return
 		}
 
-		if err := cli.SendMessage(ctx, msg.ThreadID, reply, msg.ID); err != nil {
+		if err := cli.SendMessage(ctx, msg.ThreadID, reply, ""); err != nil {
 			log.Error().Err(err).Int64("thread", msg.ThreadID).Msg("failed to send reply")
 			_ = cli.SendTypingIndicator(ctx, msg.ThreadID, false)
 			return
@@ -959,7 +967,7 @@ func runAgentAll(ctx context.Context, cfg *config.Config) {
 				return
 			}
 
-			if err := cli.SendMessage(ctx, msg.ThreadID, reply, msg.ID); err != nil {
+			if err := cli.SendMessage(ctx, msg.ThreadID, reply, ""); err != nil {
 				log.Error().Err(err).Int64("thread", msg.ThreadID).Msg("failed to send reply")
 				return
 			}
@@ -970,6 +978,7 @@ func runAgentAll(ctx context.Context, cfg *config.Config) {
 				Str("reply", truncateStr(reply, 80)).
 				Msg("agent replied")
 		}))
+
 		cli.SetEventHandler(lst.HandleEvent)
 		clients = append(clients, agentClient{cli: cli, llmAgent: llmAgent, followingCache: followingCache})
 
