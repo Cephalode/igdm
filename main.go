@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,11 +23,35 @@ import (
 	"github.com/ocythoe/igdm-go/internal/login"
 )
 
-const configPath = "~/.igdm/config.json"
+func getConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal().Err(err).Msg("get home dir")
+	}
+	return filepath.Join(home, ".igdm", "config.json")
+}
+
+var configPath = getConfigPath()
 
 func main() {
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Logger = log.Output(zerolog.NewConsoleWriter())
+
+	// Parse --verbose flag before dispatching commands
+	verbose := false
+	filteredArgs := make([]string, 0, len(os.Args))
+	for _, arg := range os.Args {
+		if arg == "--verbose" || arg == "-v" {
+			verbose = true
+		} else {
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+	os.Args = filteredArgs
+
+	if verbose {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -42,8 +67,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Enable debug logging for listen/agent commands
-	if cmd == "listen" || cmd == "listen-all" || cmd == "agent" || cmd == "agent-all" {
+	// Enable debug logging for listen/agent commands (unless already set)
+	if !verbose && (cmd == "listen" || cmd == "listen-all" || cmd == "agent" || cmd == "agent-all") {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
@@ -106,6 +131,22 @@ func main() {
 		}
 		runDebug(ctx, cfg, os.Args[2], otherAccount)
 
+	case "history":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: igdm history <account> <thread_key> [limit]")
+			os.Exit(1)
+		}
+		limit := 20
+		if len(os.Args) >= 5 {
+			if n, err := strconv.Atoi(os.Args[4]); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		runHistory(ctx, cfg, os.Args[2], os.Args[3], limit)
+
+	case "config":
+		runConfig(cfg, os.Args[2:])
+
 	case "agent":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: igdm agent <account>")
@@ -126,6 +167,12 @@ func main() {
 func printUsage() {
 	fmt.Println(`igdm - Instagram DM bot using mautrix-meta/messagix
 
+Usage:
+  igdm [flags] <command> [args...]
+
+Flags:
+  --verbose, -v    Enable debug logging for all commands
+
 Commands:
   login <account>                      Login and save session
   send <account> <user> <message>      Send a DM
@@ -135,6 +182,11 @@ Commands:
   agent-all                            Auto-reply on all accounts
   whoami <account>                     Show logged in user info
   threads <account>                    List recent threads
+  history <account> <thread_key> [N]   Show last N messages in a thread (default 20)
+  config show                          Show current configuration
+  config set <key> <value>             Set a configuration value
+  config accounts                      List configured accounts
+  debug <account> [other_account]      Debug/diagnostic output
 
 Setup:
   1. Copy personality.json.example to ~/.igdm/personality.json
@@ -153,7 +205,16 @@ Key fixes (Beeper pattern):
     sync group cursors (without this, Instagram stops pushing new messages)
   - State persistence via DumpState/LoadState preserves sync cursors across
     restarts so the server knows where to resume pushing deltas
-  - Composite event handler set once in Connect, never replaced`)
+  - Composite event handler set once in Connect, never replaced
+
+Examples:
+  igdm login myaccount
+  igdm send myaccount friend_username "Hello!"
+  igdm listen myaccount
+  igdm --verbose threads myaccount
+  igdm history myaccount 123456789 50
+  igdm config show
+  igdm config set llm.model glm-5.1`)
 }
 
 func getAccount(cfg *config.Config, name string) (config.Account, bool) {
@@ -439,6 +500,173 @@ func runDebug(ctx context.Context, cfg *config.Config, accountName, otherAccount
 	fmt.Println("=== DEBUG COMPLETE ===")
 }
 
+func runHistory(ctx context.Context, cfg *config.Config, accountName, threadKeyStr string, limit int) {
+	threadKey, err := strconv.ParseInt(threadKeyStr, 10, 64)
+	if err != nil {
+		log.Fatal().Err(err).Str("thread_key", threadKeyStr).Msg("invalid thread key")
+	}
+
+	cli := connectAccount(ctx, cfg, accountName)
+	defer func() {
+		saveSessionState(cfg, accountName, cli)
+		cli.Disconnect()
+	}()
+
+	messages, err := cli.GetThreadHistory(ctx, threadKey, limit)
+	if err != nil {
+		log.Fatal().Err(err).Msg("fetch thread history")
+	}
+
+	if len(messages) == 0 {
+		fmt.Printf("No messages found in thread %d.\n", threadKey)
+		return
+	}
+
+	fmt.Printf("Message history for thread %d (last %d messages):\n", threadKey, len(messages))
+	fmt.Println(strings.Repeat("─", 60))
+	for _, m := range messages {
+		sender := fmt.Sprintf("user_%d", m.SenderID)
+		if m.SenderID == cli.OwnUserID() {
+			sender = "you"
+		}
+		fmt.Printf("  %s  %-12s  %s\n",
+			m.Timestamp.Format("2006-01-02 15:04:05"),
+			sender,
+			m.Text,
+		)
+	}
+	fmt.Println(strings.Repeat("─", 60))
+	fmt.Printf("(%d messages)\n", len(messages))
+}
+
+func runConfig(cfg *config.Config, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: igdm config <show|set|accounts> [key] [value]")
+		os.Exit(1)
+	}
+
+	subCmd := args[0]
+	switch subCmd {
+	case "show":
+		// Show config, masking passwords
+		masked := &ConfigDisplay{
+			DataDir:  cfg.DataDir,
+			Accounts: make(map[string]AccountDisplay),
+			LLM: LLMConfigDisplay{
+				BaseURL:             cfg.LLM.BaseURL,
+				APIKeyEnv:           cfg.LLM.APIKeyEnv,
+				Model:               cfg.LLM.Model,
+				MaxHistory:          cfg.LLM.MaxHistory,
+				ResponseDelayMinSec: cfg.LLM.ResponseDelayMinSec,
+				ResponseDelayMaxSec: cfg.LLM.ResponseDelayMaxSec,
+			},
+		}
+		for name, acct := range cfg.Accounts {
+			masked.Accounts[name] = AccountDisplay{
+				Username: acct.Username,
+				Password: "********",
+			}
+		}
+		out, _ := json.MarshalIndent(masked, "", "  ")
+		fmt.Println(string(out))
+
+	case "set":
+		if len(args) < 3 {
+			fmt.Println("Usage: igdm config set <key> <value>")
+			fmt.Println("\nSupported keys:")
+			fmt.Println("  llm.model          - LLM model name")
+			fmt.Println("  llm.base_url       - LLM API base URL")
+			fmt.Println("  llm.api_key_env    - Environment variable for API key")
+			fmt.Println("  llm.max_history    - Max conversation history per thread")
+			fmt.Println("  llm.response_delay_min_sec - Min delay before reply (seconds)")
+			fmt.Println("  llm.response_delay_max_sec - Max delay before reply (seconds)")
+			os.Exit(1)
+		}
+		key, value := args[1], args[2]
+		if err := setConfigValue(cfg, key, value); err != nil {
+			log.Fatal().Err(err).Str("key", key).Msg("failed to set config value")
+		}
+		if err := cfg.Save(configPath); err != nil {
+			log.Fatal().Err(err).Msg("failed to save config")
+		}
+		fmt.Printf("✅ Set %s = %s\n", key, value)
+
+	case "accounts":
+		if len(cfg.Accounts) == 0 {
+			fmt.Println("No accounts configured.")
+			return
+		}
+		fmt.Println("Configured accounts:")
+		for name, acct := range cfg.Accounts {
+			// Check if session exists
+			sess, _ := cfg.LoadSession(name)
+			sessionStatus := "no session"
+			if sess != nil && sess.Cookies != nil {
+				sessionStatus = "session saved"
+			}
+			fmt.Printf("  %-20s  @%-20s  [%s]\n", name, acct.Username, sessionStatus)
+		}
+
+	default:
+		fmt.Printf("Unknown config subcommand: %s\n", subCmd)
+		fmt.Println("Use: config <show|set|accounts>")
+		os.Exit(1)
+	}
+}
+
+// ConfigDisplay types for masked output
+type AccountDisplay struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type LLMConfigDisplay struct {
+	BaseURL             string `json:"base_url"`
+	APIKeyEnv           string `json:"api_key_env"`
+	Model               string `json:"model"`
+	MaxHistory          int    `json:"max_history"`
+	ResponseDelayMinSec int    `json:"response_delay_min_sec"`
+	ResponseDelayMaxSec int    `json:"response_delay_max_sec"`
+}
+
+type ConfigDisplay struct {
+	DataDir  string                      `json:"data_dir"`
+	Accounts map[string]AccountDisplay   `json:"accounts"`
+	LLM      LLMConfigDisplay            `json:"llm"`
+}
+
+func setConfigValue(cfg *config.Config, key, value string) error {
+	switch key {
+	case "llm.model":
+		cfg.LLM.Model = value
+	case "llm.base_url":
+		cfg.LLM.BaseURL = value
+	case "llm.api_key_env":
+		cfg.LLM.APIKeyEnv = value
+	case "llm.max_history":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer: %w", err)
+		}
+		cfg.LLM.MaxHistory = n
+	case "llm.response_delay_min_sec":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer: %w", err)
+		}
+		cfg.LLM.ResponseDelayMinSec = n
+	case "llm.response_delay_max_sec":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer: %w", err)
+		}
+		cfg.LLM.ResponseDelayMaxSec = n
+	default:
+		return fmt.Errorf("unknown config key: %s", key)
+	}
+	return nil
+}
+
 func runAgent(ctx context.Context, cfg *config.Config, accountName string) {
 	apiKey := cfg.GetLLMAPIKey()
 	if apiKey == "" {
@@ -591,7 +819,7 @@ func runAgent(ctx context.Context, cfg *config.Config, accountName string) {
 			return
 		}
 
-		if err := cli.SendMessage(ctx, msg.ThreadID, reply, msg.ID); err != nil {
+		if err := cli.SendMessage(ctx, msg.ThreadID, reply, ""); err != nil {
 			log.Error().Err(err).Int64("thread", msg.ThreadID).Msg("failed to send reply")
 			_ = cli.SendTypingIndicator(ctx, msg.ThreadID, false)
 			return
@@ -739,7 +967,7 @@ func runAgentAll(ctx context.Context, cfg *config.Config) {
 				return
 			}
 
-			if err := cli.SendMessage(ctx, msg.ThreadID, reply, msg.ID); err != nil {
+			if err := cli.SendMessage(ctx, msg.ThreadID, reply, ""); err != nil {
 				log.Error().Err(err).Int64("thread", msg.ThreadID).Msg("failed to send reply")
 				return
 			}
@@ -750,6 +978,7 @@ func runAgentAll(ctx context.Context, cfg *config.Config) {
 				Str("reply", truncateStr(reply, 80)).
 				Msg("agent replied")
 		}))
+
 		cli.SetEventHandler(lst.HandleEvent)
 		clients = append(clients, agentClient{cli: cli, llmAgent: llmAgent, followingCache: followingCache})
 
